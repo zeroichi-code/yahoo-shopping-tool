@@ -1,0 +1,6 @@
+node_modules/
+kaitori_price_cache.json
+result*.json
+*.tmp
+.claude/
+settings.local.json
