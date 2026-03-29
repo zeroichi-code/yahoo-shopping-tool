@@ -834,6 +834,10 @@ function parseKeywordAndExpectedPrice(raw) {
       expectedPrice = Number(part);
     }
   }
+  // キーワード自体がJANコードの場合（例: "4548736132566, 32400"）
+  if (jan == null && /^\d{8}$|^\d{12,13}$/.test(keyword)) {
+    jan = keyword;
+  }
   return { keyword, jan, expectedPrice };
 }
 
