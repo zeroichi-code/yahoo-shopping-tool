@@ -31,9 +31,6 @@ const DEFAULTS = {
   timeoutMs: 30000,
   delayMinMs: 1000,
   delayMaxMs: 3000,
-  cacheFile: "kaitori_price_cache.json",
-  cacheTtlDays: 10,
-  noCache: false,
 };
 
 function parseArgs(argv) {
@@ -101,14 +98,6 @@ function parseArgs(argv) {
     } else if (arg === "--delay-max") {
       args.delayMaxMs = Number(next);
       i += 1;
-    } else if (arg === "--cache-file") {
-      args.cacheFile = next;
-      i += 1;
-    } else if (arg === "--cache-ttl-days") {
-      args.cacheTtlDays = Number(next);
-      i += 1;
-    } else if (arg === "--no-cache") {
-      args.noCache = true;
     } else if (arg === "--help" || arg === "-h") {
       args.help = true;
     }
@@ -142,9 +131,6 @@ Options:
   --min-profit <yen>     最低利益フィルタ (デフォルト: 0)
   --storage-state <path> Playwright storageState JSON (Yahoo ログイン済みセッション)
   --json <path>          結果をJSONファイルに出力
-  --cache-file <path>    買取価格キャッシュファイルパス（デフォルト: kaitori_price_cache.json）
-  --cache-ttl-days <n>   キャッシュ有効期間・日数（デフォルト: 7）
-  --no-cache             キャッシュを使用しない
   --help                 このヘルプを表示
 `);
 }
@@ -713,12 +699,9 @@ async function searchKaitorishouten(query, timeoutMs) {
   }
 }
 
-// JANで検索→0件ならmodelHint（型番候補）の順に試みる
-function buildKaitoriQueries(yahooItem) {
-  const queries = [];
-  if (yahooItem.jan) queries.push(yahooItem.jan);
-  if (yahooItem.modelHint) queries.push(yahooItem.modelHint);
-  return queries.length ? queries : [""];
+// keywords.txt のJANコードでのみ検索する
+function buildKaitoriQueries(kwJan) {
+  return kwJan ? [kwJan] : [];
 }
 
 function pickKaitorishoutenBest(products, yahooItem) {
@@ -777,22 +760,6 @@ async function runPool(items, concurrency, worker) {
 // 買取価格キャッシュ
 // ---------------------------------------------------------------------------
 
-async function loadKaitoriCache(filePath) {
-  const fs = await import("node:fs/promises");
-  try {
-    const text = await fs.readFile(filePath, "utf8");
-    return new Map(Object.entries(JSON.parse(text)));
-  } catch {
-    return new Map(); // ファイルなし or JSON破損 → 空Map
-  }
-}
-
-async function saveKaitoriCache(filePath, cache) {
-  const fs = await import("node:fs/promises");
-  const tmp = `${filePath}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(Object.fromEntries(cache), null, 2), "utf8");
-  await fs.rename(tmp, filePath);
-}
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -904,7 +871,11 @@ async function rewriteKeywordsFile(filePath, parsedLines, profitableKeywords, sc
     }
 
     // max-items の切り捨てでスキャン未実施のキーワードは miss を変えない
-    if (!scannedKeywords.has(entry.keyword)) return entry.original;
+    // ただし日付未記入の場合は初回として #today miss:0 を付与する
+    if (!scannedKeywords.has(entry.keyword)) {
+      if (entry.date === null) return `${keywordPart} #${today} miss:0`;
+      return entry.original;
+    }
 
     // 利益なし: miss をインクリメント
     const newMiss = entry.miss + 1;
@@ -944,7 +915,7 @@ function formatYen(n) {
 
 function printResultTable(results) {
   if (!results.length) {
-    console.log("\n利益が出る候補は見つかりませんでした。");
+    console.log("\n利益が出る候補は見つかりませんでした。\nスキャン完了。");
     return;
   }
 
@@ -969,6 +940,7 @@ function printResultTable(results) {
     ];
     console.log(line.join(SEP));
   });
+  console.log("\nスキャン完了。");
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,10 +1013,6 @@ async function main() {
   }
 
   const today = new Date().toISOString().slice(0, 10);
-  const cacheTtlMs = args.cacheTtlDays * 24 * 60 * 60 * 1000;
-  const kaitoriCache = args.noCache ? new Map() : await loadKaitoriCache(args.cacheFile);
-  let kaitoriCacheDirty = false;
-
   const yahooClient = await createYahooClient(args);
   const keywords = args.keywords?.length ? args.keywords : [""];
   console.log(
@@ -1165,27 +1133,14 @@ async function main() {
         return { itemUrl, skipped: true, reason: `除外キーワード: ${hitExclude}` };
       }
 
+      const itemKws = urlKeywordMap.get(itemUrl) ?? new Set();
+
       // 期待価格チェック（アクセサリー除外）
-      // 優先度: 1.キャッシュの前回買取価格 → 2.キーワードファイルの指定価格
       {
         let expectedPrice = null;
-        const itemKeywordsForExp = urlKeywordMap.get(itemUrl) ?? new Set();
-        // 1. キャッシュから取得（parsed.jan → キーワードファイルのJANの順でフォールバック）
-        if (!args.noCache) {
-          const janForCache = parsed.jan
-            ?? [...itemKeywordsForExp].map((kw) => keywordJanMap.get(kw)).find(Boolean)
-            ?? null;
-          if (janForCache) {
-            const cacheEntry = kaitoriCache.get(janForCache);
-            if (cacheEntry?.kaitoriPrice != null) expectedPrice = cacheEntry.kaitoriPrice;
-          }
-        }
-        // 2. キーワードファイルの期待価格
-        if (expectedPrice == null) {
-          for (const kw of itemKeywordsForExp) {
-            const ep = keywordExpectedPriceMap.get(kw);
-            if (ep != null) { expectedPrice = ep; break; }
-          }
+        for (const kw of itemKws) {
+          const ep = keywordExpectedPriceMap.get(kw);
+          if (ep != null) { expectedPrice = ep; break; }
         }
         if (expectedPrice != null && parsed.price <= expectedPrice * 0.7) {
           console.log(`  [期待価格除外] Yahoo:${formatYen(parsed.price)} ≤ 期待${formatYen(expectedPrice)}×70%: ${parsed.title?.slice(0, 50)}`);
@@ -1199,78 +1154,67 @@ async function main() {
       const effectivePrice = parsed.price - parsed.point;
       const effectivePriceWithEntry = parsed.price - parsed.pointWithEntry;
 
-      // 買取商店をPlaywrightで検索（JAN→型番→タイトルの順でフォールバック）
+      // 買取商店をPlaywrightで検索（keywords.txtのJANのみ使用）
       // キャッシュがあれば Playwright をスキップ
-      const queries = buildKaitoriQueries(parsed);
+      const kwJan = [...itemKws].map((kw) => keywordJanMap.get(kw)).find(Boolean) ?? null;
+      const queries = buildKaitoriQueries(kwJan);
+      if (queries.length === 0) {
+        console.log(`  [JAN未設定] keywords.txtにJANなしのためスキップ: ${parsed.title?.slice(0, 50)}`);
+        return { itemUrl, skipped: true, reason: "keywords.txtにJANなし" };
+      }
       let kaitoriProducts = [];
       let usedQuery = queries[0];
       let kaitoriPrice = null;
       let kaitoriMatched = null;
-      let kaitoriCacheHit = false;
 
-      // 1キーワード1検索の原則: 同一キーワードで取得済みならその価格を再利用
-      const itemKws = urlKeywordMap.get(itemUrl) ?? new Set();
+      // 1キーワード1検索の原則: 同一キーワードで取得済みならそのPromiseを再利用
+      // Promiseをawait前にMapへ登録することで、並列タスクによる二重アクセスを防ぐ
       const reusedEntry = [...itemKws]
-        .map((kw) => ({ kw, result: keywordKaitoriResultMap.get(kw) }))
+        .map((kw) => ({ kw, promise: keywordKaitoriResultMap.get(kw) }))
         .find((e) => keywordKaitoriResultMap.has(e.kw));
 
       if (reusedEntry !== undefined) {
-        kaitoriPrice = reusedEntry.result;
-        kaitoriCacheHit = true;
+        kaitoriPrice = await reusedEntry.promise;
         const label = kaitoriPrice == null ? "買い取りなし" : formatYen(kaitoriPrice);
         console.log(`  [Skip] 同一キーワード "${reusedEntry.kw}" のため、取得済みの買取価格を再利用します: ${label}`);
       } else {
-        for (const q of queries) {
-          usedQuery = q;
+        const fetchPromise = (async () => {
+          for (const q of queries) {
+            usedQuery = q;
 
-          // キャッシュチェック
-          if (!args.noCache) {
-            const entry = kaitoriCache.get(q);
-            if (entry) {
-              const isFresh = (new Date(today) - new Date(entry.cachedAt)) <= cacheTtlMs;
-              if (isFresh) {
-                kaitoriPrice = entry.kaitoriPrice;
-                kaitoriCacheHit = true;
-                const label = kaitoriPrice == null ? "買い取りなし" : `${kaitoriPrice}円`;
-                console.log(`  [キャッシュ] query="${q}" → ${label}`);
-                break;
-              }
-            }
+            // Playwright検索
+            console.log(`  [買取検索] query="${q}"`);
+            kaitoriProducts = await searchKaitorishouten(q, args.timeoutMs);
+            kaitoriMatched = pickKaitorishoutenBest(kaitoriProducts, parsed);
+            const price = kaitoriMatched?.price ?? null;
+            const resultLabel = price != null ? formatYen(price) : `結果なし(${kaitoriProducts.length}件)`;
+            console.log(`  [買取結果] query="${q}" → ${resultLabel}`);
+
+            if (kaitoriProducts.length > 0) return price;
           }
+          return null;
+        })();
 
-          // Playwright検索
-          kaitoriProducts = await searchKaitorishouten(q, args.timeoutMs);
-          kaitoriMatched = pickKaitorishoutenBest(kaitoriProducts, parsed);
-          kaitoriPrice = kaitoriMatched?.price ?? null;
-
-          // キャッシュ保存（null も「結果なし」として記録）
-          if (!args.noCache) {
-            kaitoriCache.set(q, { kaitoriPrice, cachedAt: today });
-            kaitoriCacheDirty = true;
-          }
-
-          if (kaitoriProducts.length > 0) break;
-        }
-
-        // 取得結果をキーワードごとに記録（以降の同キーワード商品はアクセス不要）
+        // awaitより前にPromiseを登録することで並列タスクが二重アクセスしない
         for (const kw of itemKws) {
           if (!keywordKaitoriResultMap.has(kw)) {
-            keywordKaitoriResultMap.set(kw, kaitoriPrice);
+            keywordKaitoriResultMap.set(kw, fetchPromise);
           }
         }
+
+        kaitoriPrice = await fetchPromise;
       }
 
-      // 買取価格がYahoo販売価格の1.5倍以上なら誤マッチとして除外（キャッシュ利用時はスキップ）
+      // 買取価格がYahoo販売価格の1.5倍以上なら誤マッチとして除外
       // （アクセサリーがPS5本体価格にマッチするようなケースを防ぐ）
-      if (!kaitoriCacheHit && kaitoriPrice != null && kaitoriPrice > parsed.price * 1.5) {
+      if (kaitoriPrice != null && kaitoriPrice > parsed.price * 1.5) {
         console.warn(`  [誤マッチ除外] ${parsed.title?.slice(0, 30)}… Yahoo:${parsed.price}円 買取:${kaitoriPrice}円`);
         kaitoriPrice = null;
       }
 
       // キーワードファイルの期待価格を最新買取価格で自動更新
       if (kaitoriPrice != null && kaitoriPrice > 0 && keywordsParsedLines) {
-        const itemKeywords = urlKeywordMap.get(itemUrl) ?? new Set();
-        for (const kw of itemKeywords) {
+        for (const kw of itemKws) {
           const kwEntry = keywordEntryMap.get(kw);
           if (!kwEntry) continue;
           if (kwEntry.expectedPrice !== kaitoriPrice) {
@@ -1319,7 +1263,6 @@ async function main() {
         kaitoriQuery: usedQuery,
         kaitoriMatchCount: kaitoriProducts.length,
         kaitoriMatched,
-        kaitoriCacheHit,
         kaitoriPrice,
         profit,
         profitWithEntry,
@@ -1427,10 +1370,6 @@ async function main() {
       console.log(`\nJSON saved: ${args.jsonPath}`);
     }
   } finally {
-    if (!args.noCache && kaitoriCacheDirty) {
-      await saveKaitoriCache(args.cacheFile, kaitoriCache);
-      console.log(`\n買取価格キャッシュ保存: ${args.cacheFile} (${kaitoriCache.size}件)`);
-    }
     await yahooClient.close();
     await closeKaitoriBrowser();
   }
