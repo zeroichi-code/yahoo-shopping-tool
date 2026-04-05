@@ -1,7 +1,8 @@
-name: ヤフショ週次スキャン（日曜0:01 JST）
+name: ヤフショ週末スキャン（土・日 0:01 JST）
 
 on:
   schedule:
+    - cron: '1 15 * * 5'  # 金曜15:01 UTC = 土曜0:01 JST
     - cron: '1 15 * * 6'  # 土曜15:01 UTC = 日曜0:01 JST
   workflow_dispatch:       # 手動実行も可
 
