@@ -1060,7 +1060,7 @@ async function sendTelegramNotification(token, chatId, profitable, today) {
       const yahooPrice = r.yahooPrice != null ? `${r.yahooPrice.toLocaleString("ja-JP")}円` : "-";
       const effectivePrice = r.effectivePrice != null ? `${Math.round(r.effectivePrice).toLocaleString("ja-JP")}円` : "-";
       const kaitoriPrice = r.kaitoriPrice != null ? `${r.kaitoriPrice.toLocaleString("ja-JP")}円` : "-";
-      lines.push(`${i + 1}. ${(r.title || "").slice(0, 50)}`);
+      lines.push(`${i + 1}. [${r.storeId || "?"}] ${(r.title || "").slice(0, 50)}`);
       lines.push(`   利益率: ${rate} / 現金利益: ${profit}`);
       lines.push(`   Yahoo: ${yahooPrice} / 実質: ${effectivePrice} / 買取: ${kaitoriPrice}`);
       if (r.itemUrl) lines.push(`   ${r.itemUrl}`);
