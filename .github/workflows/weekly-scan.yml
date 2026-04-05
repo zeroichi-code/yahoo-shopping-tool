@@ -1,0 +1,30 @@
+name: ヤフショ週次スキャン（日曜0:01 JST）
+
+on:
+  schedule:
+    - cron: '1 15 * * 6'  # 土曜15:01 UTC = 日曜0:01 JST
+  workflow_dispatch:       # 手動実行も可
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Node.js セットアップ
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 依存パッケージをインストール
+        run: npm install --ignore-scripts
+
+      - name: ヤフショスキャン実行
+        run: |
+          node yahoo-store-profit-scan.mjs \
+            --kaitori morimori \
+            --telegram-token ${{ secrets.TELEGRAM_TOKEN }} \
+            --telegram-chat-id ${{ secrets.TELEGRAM_CHAT_ID }}

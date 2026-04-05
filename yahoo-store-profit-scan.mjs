@@ -13,6 +13,7 @@ const DEFAULT_EXCLUDE_KEYWORDS = [
   "難あり", "傷あり", "返品不可", "アウトレット", "開封済",
 ];
 
+
 const DEFAULTS = {
   pages: 1,
   maxItems: 30,
@@ -31,6 +32,7 @@ const DEFAULTS = {
   timeoutMs: 30000,
   delayMinMs: 1000,
   delayMaxMs: 3000,
+  kaitori: "shouten",
 };
 
 function parseArgs(argv) {
@@ -98,6 +100,19 @@ function parseArgs(argv) {
     } else if (arg === "--delay-max") {
       args.delayMaxMs = Number(next);
       i += 1;
+    } else if (arg === "--kaitori") {
+      args.kaitori = next;
+      i += 1;
+    } else if (arg === "--base-point-rate") {
+      args.basePointRate = Number(next);
+      args.basePointRateOverride = true;
+      i += 1;
+    } else if (arg === "--telegram-token") {
+      args.telegramToken = next;
+      i += 1;
+    } else if (arg === "--telegram-chat-id") {
+      args.telegramChatId = next;
+      i += 1;
     } else if (arg === "--help" || arg === "-h") {
       args.help = true;
     }
@@ -130,7 +145,11 @@ Options:
   --min-inventory <n>          在庫数がこの個数未満の商品をスキップ（デフォルト: 10）
   --min-profit <yen>     最低利益フィルタ (デフォルト: 0)
   --storage-state <path> Playwright storageState JSON (Yahoo ログイン済みセッション)
+  --kaitori <shouten|morimori>
+                         買取先サービス (デフォルト: shouten)
   --json <path>          結果をJSONファイルに出力
+  --telegram-token <token>    Telegram Bot APIトークン
+  --telegram-chat-id <id>     Telegram チャットID（通知先）
   --help                 このヘルプを表示
 `);
 }
@@ -156,6 +175,9 @@ function ensureValidArgs(args) {
   }
   if (!Number.isFinite(args.delayMaxMs) || args.delayMaxMs < args.delayMinMs) {
     throw new Error("--delay-max must be >= --delay-min");
+  }
+  if (!["shouten", "morimori"].includes(args.kaitori)) {
+    throw new Error("--kaitori must be one of: shouten, morimori");
   }
 }
 
@@ -477,6 +499,17 @@ function parseNextDataFromYahooItem(html) {
   const inventory =
     item.inventory ?? item.stock ?? item.stockCount ?? item.quantity ?? null;
 
+  // ストアポイント倍率を取得（currentCampaignList から "ストアポイント" エントリを探す）
+  let storePointRatio = 1; // デフォルト1%
+  for (const campaign of point.currentCampaignList ?? []) {
+    for (const part of campaign.partsCampaignList ?? []) {
+      if (part.title === "ストアポイント") {
+        storePointRatio = part.ratio ?? 1;
+        break;
+      }
+    }
+  }
+
   return {
     title: item.name || null,
     jan: jan || null,
@@ -485,6 +518,7 @@ function parseNextDataFromYahooItem(html) {
     pointWithEntry: normalizeYen(totalPointWithEntry) ?? normalizeYen(totalPoint) ?? 0,
     modelHint: extractModelHint(item.name || ""),
     inventory: inventory != null ? Number(inventory) : null,
+    storePointRatio,
   };
 }
 
@@ -498,6 +532,52 @@ function extractModelHint(title) {
 
   const candidate = parts.find((p) => /[A-Za-z].*\d|\d.*[A-Za-z]/.test(p) && p.length >= 5);
   return candidate || parts.slice(0, 3).join(" ");
+}
+
+// ---------------------------------------------------------------------------
+// 森森買取 HTTP scraping
+// ---------------------------------------------------------------------------
+
+function stripHtml(html) {
+  return html
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseMorimoriProducts(html) {
+  const blocks = html.split(/<div class="product-item\b/).slice(1);
+  const rows = [];
+
+  for (const block of blocks) {
+    const nameRaw = block.match(/<h4 class="search-product-details-name">([\s\S]*?)<\/h4>/i)?.[1] || "";
+    const name = stripHtml(nameRaw);
+    const jan = block.match(/JAN\s*[:：]\s*(\d{8,14})/i)?.[1] || null;
+    const normal = normalizeYen(
+      block.match(/<div class="price-normal-number">([\s\S]*?)<\/div>/i)?.[1] || "",
+    );
+    const relUrl = block.match(/<a href=['"]([^'"]*\/product\/[^'"]+)['"]/i)?.[1] || null;
+
+    if (!name && !jan) continue;
+
+    rows.push({
+      name,
+      jan,
+      price: normal,
+      url: relUrl ? new URL(relUrl, "https://www.morimori-kaitori.jp").href : null,
+    });
+  }
+
+  return rows;
+}
+
+async function searchMorimori(query, timeoutMs) {
+  const url = `https://www.morimori-kaitori.jp/search?sk=${encodeURIComponent(query)}`;
+  const html = await fetchText(url, timeoutMs);
+  return parseMorimoriProducts(html);
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +628,27 @@ async function closeKaitoriBrowser() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 買取プロバイダーファクトリ
+// ---------------------------------------------------------------------------
+
+function createKaitoriProvider(args) {
+  switch (args.kaitori) {
+    case "morimori":
+      return {
+        name: "morimori",
+        search: (query, timeoutMs) => searchMorimori(query, timeoutMs),
+        close: async () => {},
+      };
+    case "shouten":
+    default:
+      return {
+        name: "shouten",
+        search: (query, timeoutMs) => searchKaitorishouten(query, timeoutMs),
+        close: closeKaitoriBrowser,
+      };
+  }
+}
 
 /**
  * 買取商店でクエリ（JANコードまたは商品名）を検索し、
@@ -704,7 +805,7 @@ function buildKaitoriQueries(kwJan) {
   return kwJan ? [kwJan] : [];
 }
 
-function pickKaitorishoutenBest(products, yahooItem) {
+function pickKaitoriBest(products, yahooItem) {
   if (!products.length) return null;
 
   const withPrice = products.filter((p) => p.price != null);
@@ -944,6 +1045,48 @@ function printResultTable(results) {
 }
 
 // ---------------------------------------------------------------------------
+// Telegram通知
+// ---------------------------------------------------------------------------
+
+async function sendTelegramNotification(token, chatId, profitable, today) {
+  let text;
+  if (profitable.length === 0) {
+    text = `[ヤフショスキャン ${today}]\n利益商品は見つかりませんでした。`;
+  } else {
+    const lines = [`[ヤフショスキャン ${today}] 利益商品 ${profitable.length}件\n`];
+    for (const [i, r] of profitable.entries()) {
+      const rate = r.baseProfitRate != null ? `${(r.baseProfitRate * 100).toFixed(1)}%` : "-";
+      const profit = r.baseProfit != null ? `${Math.round(r.baseProfit).toLocaleString("ja-JP")}円` : "-";
+      const yahooPrice = r.yahooPrice != null ? `${r.yahooPrice.toLocaleString("ja-JP")}円` : "-";
+      const effectivePrice = r.effectivePrice != null ? `${Math.round(r.effectivePrice).toLocaleString("ja-JP")}円` : "-";
+      const kaitoriPrice = r.kaitoriPrice != null ? `${r.kaitoriPrice.toLocaleString("ja-JP")}円` : "-";
+      lines.push(`${i + 1}. ${(r.title || "").slice(0, 50)}`);
+      lines.push(`   利益率: ${rate} / 現金利益: ${profit}`);
+      lines.push(`   Yahoo: ${yahooPrice} / 実質: ${effectivePrice} / 買取: ${kaitoriPrice}`);
+      if (r.itemUrl) lines.push(`   ${r.itemUrl}`);
+    }
+    text = lines.join("\n");
+  }
+
+  // Telegramの1メッセージ上限は4096文字
+  if (text.length > 4096) {
+    text = text.slice(0, 4090) + "\n...";
+  }
+
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Telegram API エラー: ${res.status} ${body}`);
+  }
+  console.log("Telegram通知送信完了");
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -985,50 +1128,46 @@ async function main() {
     args.excludeKeywords = [...new Set(excludes)];
   }
 
-  // キーワードファイルの読み込み（アクティブのみ検索対象）
-  let keywordsParsedLines = null;
-  if (args.keywordsFile) {
-    const fs = await import("node:fs/promises");
-    const text = await fs.readFile(args.keywordsFile, "utf8");
-    keywordsParsedLines = parseKeywordsFileFull(text);
-    const activeEntries = keywordsParsedLines.filter((e) => e.type === "keyword");
-    const commentedCount = keywordsParsedLines.filter((e) => e.type === "commented_keyword").length;
-    if (!args.keywords) args.keywords = [];
-    args.keywords.push(...activeEntries.map((e) => e.keyword));
-    console.log(`キーワードファイル読み込み: ${args.keywordsFile} (検索対象: ${activeEntries.length}件, 除外済み: ${commentedCount}件)`);
-  }
+  const _d = new Date();
+  const today = `${_d.getFullYear()}-${String(_d.getMonth() + 1).padStart(2, "0")}-${String(_d.getDate()).padStart(2, "0")}`;
 
-  // キーワード → 期待価格マップ / JANマップ / entryオブジェクト（自動更新用）
-  const keywordExpectedPriceMap = new Map();
-  const keywordJanMap = new Map();
-  const keywordEntryMap = new Map();
-  if (keywordsParsedLines) {
-    for (const entry of keywordsParsedLines) {
-      if (entry.type === "keyword") {
-        keywordEntryMap.set(entry.keyword, entry);
-        if (entry.expectedPrice != null) keywordExpectedPriceMap.set(entry.keyword, entry.expectedPrice);
-        if (entry.jan != null) keywordJanMap.set(entry.keyword, entry.jan);
+  // 編集可_daily-bonus.txt から今日のボーナス還元率を加算（手動上書き時はスキップ）
+  if (!args.basePointRateOverride) {
+    try {
+      const fs = await import("node:fs/promises");
+      const bonusText = await fs.readFile("編集可_daily-bonus.txt", "utf8");
+      const dailyBonus = {};
+      for (const line of bonusText.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const [dayStr, rateStr] = trimmed.split("=");
+        const day = Number(dayStr.trim());
+        const rate = Number(rateStr.trim());
+        if (!isNaN(day) && !isNaN(rate)) dailyBonus[day] = rate / 100;
       }
+      const bonus = dailyBonus[_d.getDate()] ?? 0;
+      if (bonus > 0) {
+        args.basePointRate += bonus;
+        console.log(`[デイリーボーナス] ${_d.getDate()}日 +${(bonus * 100).toFixed(0)}% → 合計還元率: ${(args.basePointRate * 100).toFixed(0)}%`);
+      }
+    } catch {
+      // ファイルなければスキップ
     }
   }
 
-  const today = new Date().toISOString().slice(0, 10);
   const yahooClient = await createYahooClient(args);
-  const keywords = args.keywords?.length ? args.keywords : [""];
+  const kaitoriProvider = createKaitoriProvider(args);
   console.log(
-    `Scanning stores=${args.stores.join(",")}, keywords=[${keywords.join(", ")}], pages=${args.pages}, yahooMode=${yahooClient.mode}, pointSource=${args.pointSource}`,
+    `Scanning stores=${args.stores.join(",")}, pages=${args.pages}, yahooMode=${yahooClient.mode}, kaitori=${kaitoriProvider.name}, pointSource=${args.pointSource}`,
   );
 
   try {
-    // --- 全店舗×全キーワードの検索ページエントリを生成 ---
+    // --- 全店舗の検索ページエントリを生成 ---
     const pageEntries = args.stores.flatMap((storeId) =>
-      keywords.flatMap((kw) =>
-        Array.from({ length: args.pages }, (_, i) => ({
-          url: buildStoreSearchUrl(storeId, kw, i + 1),
-          keyword: kw,
-          storeId,
-        })),
-      ),
+      Array.from({ length: args.pages }, (_, i) => ({
+        url: buildStoreSearchUrl(storeId, "", i + 1),
+        storeId,
+      })),
     );
     const pageUrls = pageEntries.map((e) => e.url);
 
@@ -1043,17 +1182,21 @@ async function main() {
       },
     );
 
-    // 全店舗の商品URLをまとめて収集（プレフィルター＋優先度分類）
-    const priority1 = new Set(); // 最優先: priorityMinPrice〜priorityMaxPrice
-    const priority2 = new Set(); // 通常:   その他の許容価格帯
-    const urlKeywordMap = new Map();      // itemUrl → 検索キーワードSet
+    // 店舗ごとに商品URLを収集（プレフィルター＋優先度分類）
     const urlListingPriceMap = new Map(); // itemUrl → listingPrice
     let preFilteredCount = 0;
+
+    // storeId → { priority1: Set, priority2: Set }
+    const storeUrlMap = new Map();
+    for (const storeId of args.stores) {
+      storeUrlMap.set(storeId, { priority1: new Set(), priority2: new Set() });
+    }
 
     for (let i = 0; i < pageEntries.length; i++) {
       const html = searchHtmlList[i];
       if (!html || typeof html !== "string") continue;
-      const { storeId, keyword } = pageEntries[i];
+      const { storeId } = pageEntries[i];
+      const { priority1, priority2 } = storeUrlMap.get(storeId);
       const items = extractYahooItemsFromSearch(html, storeId);
       for (const { url, listingPrice, listingInventory } of items) {
         // ハードフィルター: 価格帯外は完全除外
@@ -1068,8 +1211,6 @@ async function main() {
           preFilteredCount++;
           continue;
         }
-        if (!urlKeywordMap.has(url)) urlKeywordMap.set(url, new Set());
-        if (keyword) urlKeywordMap.get(url).add(keyword);
         if (listingPrice != null) urlListingPriceMap.set(url, listingPrice);
         // 優先度分類（価格不明はpriority2）
         const isPriority1 = listingPrice != null
@@ -1080,31 +1221,30 @@ async function main() {
       }
     }
 
-    // 優先度1 → 優先度2 の順に並べて max-items で切る
-    // 各優先度グループ内は「期待価格との差が小さい順」にソートして本体候補を先頭にする
-    function sortByExpectedPrice(urls) {
+    // 店舗ごとに max-items で切ってから結合
+    // 各グループ内は価格の高い順（高価格ほど利益が出やすい）
+    function sortByPrice(urls) {
       return [...urls].sort((a, b) => {
-        const priceA = urlListingPriceMap.get(a);
-        const priceB = urlListingPriceMap.get(b);
-        const kwsA = urlKeywordMap.get(a) ?? new Set();
-        const kwsB = urlKeywordMap.get(b) ?? new Set();
-        const expA = Math.max(0, ...[...kwsA].map((kw) => keywordExpectedPriceMap.get(kw) ?? 0));
-        const expB = Math.max(0, ...[...kwsB].map((kw) => keywordExpectedPriceMap.get(kw) ?? 0));
-        const diffA = expA > 0 && priceA != null ? Math.abs(priceA - expA) : Infinity;
-        const diffB = expB > 0 && priceB != null ? Math.abs(priceB - expB) : Infinity;
-        return diffA - diffB;
+        const priceA = urlListingPriceMap.get(a) ?? 0;
+        const priceB = urlListingPriceMap.get(b) ?? 0;
+        return priceB - priceA;
       });
     }
-    const allUrls = [
-      ...sortByExpectedPrice(priority1),
-      ...sortByExpectedPrice([...priority2].filter((u) => !priority1.has(u))),
-    ];
-    const itemUrls = allUrls.slice(0, args.maxItems);
-    const preFilterNote = preFilteredCount > 0 ? ` (除外: ${preFilteredCount}件)` : "";
-    console.log(`Found item URLs: 優先(${priority1.size}) + 通常(${priority2.size})${preFilterNote} → スキャン対象: ${itemUrls.length}件`);
 
-    // キーワードごとの買取商店アクセス済み結果（1キーワード1検索の原則）
-    const keywordKaitoriResultMap = new Map(); // keyword → kaitoriPrice | null
+    const itemUrls = [];
+    const preFilterNote = preFilteredCount > 0 ? ` (除外: ${preFilteredCount}件)` : "";
+    for (const [storeId, { priority1, priority2 }] of storeUrlMap) {
+      const storeUrls = [
+        ...sortByPrice(priority1),
+        ...sortByPrice([...priority2].filter((u) => !priority1.has(u))),
+      ].slice(0, args.maxItems);
+      console.log(`  [${storeId}] 優先(${priority1.size}) + 通常(${priority2.size}) → ${storeUrls.length}件`);
+      itemUrls.push(...storeUrls);
+    }
+    console.log(`Found item URLs: 計${itemUrls.length}件${preFilterNote}`);
+
+    // JAN単位で買取検索結果をキャッシュ（1JAN1検索の原則）
+    const janKaitoriResultMap = new Map(); // jan → Promise<kaitoriPrice | null>
 
     // --- 各商品の詳細取得 + 買取商店検索 ---
     const detailRows = await runPool(itemUrls, args.concurrency, async (itemUrl) => {
@@ -1133,59 +1273,37 @@ async function main() {
         return { itemUrl, skipped: true, reason: `除外キーワード: ${hitExclude}` };
       }
 
-      const itemKws = urlKeywordMap.get(itemUrl) ?? new Set();
-
-      // 期待価格チェック（アクセサリー除外）
-      {
-        let expectedPrice = null;
-        for (const kw of itemKws) {
-          const ep = keywordExpectedPriceMap.get(kw);
-          if (ep != null) { expectedPrice = ep; break; }
-        }
-        if (expectedPrice != null && parsed.price <= expectedPrice * 0.7) {
-          console.log(`  [期待価格除外] Yahoo:${formatYen(parsed.price)} ≤ 期待${formatYen(expectedPrice)}×70%: ${parsed.title?.slice(0, 50)}`);
-          return { itemUrl, skipped: true, reason: `期待価格比較で除外: ${parsed.price}円` };
-        }
-      }
-
       const selectedPoint =
         args.pointSource === "with-entry" ? parsed.pointWithEntry : parsed.point;
       const selectedEffectivePrice = parsed.price - selectedPoint;
       const effectivePrice = parsed.price - parsed.point;
       const effectivePriceWithEntry = parsed.price - parsed.pointWithEntry;
 
-      // 買取商店をPlaywrightで検索（keywords.txtのJANのみ使用）
-      // キャッシュがあれば Playwright をスキップ
-      const kwJan = [...itemKws].map((kw) => keywordJanMap.get(kw)).find(Boolean) ?? null;
-      const queries = buildKaitoriQueries(kwJan);
+      // 買取先を検索（商品ページのJANを使用）
+      const queries = buildKaitoriQueries(parsed.jan);
       if (queries.length === 0) {
-        console.log(`  [JAN未設定] keywords.txtにJANなしのためスキップ: ${parsed.title?.slice(0, 50)}`);
-        return { itemUrl, skipped: true, reason: "keywords.txtにJANなし" };
+        console.log(`  [JAN未設定] 商品ページにJANなしのためスキップ: ${parsed.title?.slice(0, 50)}`);
+        return { itemUrl, skipped: true, reason: "商品ページにJANなし" };
       }
       let kaitoriProducts = [];
       let usedQuery = queries[0];
       let kaitoriPrice = null;
       let kaitoriMatched = null;
 
-      // 1キーワード1検索の原則: 同一キーワードで取得済みならそのPromiseを再利用
-      // Promiseをawait前にMapへ登録することで、並列タスクによる二重アクセスを防ぐ
-      const reusedEntry = [...itemKws]
-        .map((kw) => ({ kw, promise: keywordKaitoriResultMap.get(kw) }))
-        .find((e) => keywordKaitoriResultMap.has(e.kw));
-
-      if (reusedEntry !== undefined) {
-        kaitoriPrice = await reusedEntry.promise;
+      // 1JAN1検索の原則: 同一JANで取得済みならPromiseを再利用
+      const cachedPromise = janKaitoriResultMap.get(parsed.jan);
+      if (cachedPromise !== undefined) {
+        kaitoriPrice = await cachedPromise;
         const label = kaitoriPrice == null ? "買い取りなし" : formatYen(kaitoriPrice);
-        console.log(`  [Skip] 同一キーワード "${reusedEntry.kw}" のため、取得済みの買取価格を再利用します: ${label}`);
+        console.log(`  [Skip] 同一JAN "${parsed.jan}" のため、取得済みの買取価格を再利用します: ${label}`);
       } else {
         const fetchPromise = (async () => {
           for (const q of queries) {
             usedQuery = q;
 
-            // Playwright検索
-            console.log(`  [買取検索] query="${q}"`);
-            kaitoriProducts = await searchKaitorishouten(q, args.timeoutMs);
-            kaitoriMatched = pickKaitorishoutenBest(kaitoriProducts, parsed);
+            console.log(`  [買取検索] provider=${kaitoriProvider.name} query="${q}"`);
+            kaitoriProducts = await kaitoriProvider.search(q, args.timeoutMs);
+            kaitoriMatched = pickKaitoriBest(kaitoriProducts, parsed);
             const price = kaitoriMatched?.price ?? null;
             const resultLabel = price != null ? formatYen(price) : `結果なし(${kaitoriProducts.length}件)`;
             console.log(`  [買取結果] query="${q}" → ${resultLabel}`);
@@ -1196,11 +1314,7 @@ async function main() {
         })();
 
         // awaitより前にPromiseを登録することで並列タスクが二重アクセスしない
-        for (const kw of itemKws) {
-          if (!keywordKaitoriResultMap.has(kw)) {
-            keywordKaitoriResultMap.set(kw, fetchPromise);
-          }
-        }
+        janKaitoriResultMap.set(parsed.jan, fetchPromise);
 
         kaitoriPrice = await fetchPromise;
       }
@@ -1212,30 +1326,21 @@ async function main() {
         kaitoriPrice = null;
       }
 
-      // キーワードファイルの期待価格を最新買取価格で自動更新
-      if (kaitoriPrice != null && kaitoriPrice > 0 && keywordsParsedLines) {
-        for (const kw of itemKws) {
-          const kwEntry = keywordEntryMap.get(kw);
-          if (!kwEntry) continue;
-          if (kwEntry.expectedPrice !== kaitoriPrice) {
-            console.log(`  [期待価格更新] "${kw}" ${formatYen(kwEntry.expectedPrice)} → ${formatYen(kaitoriPrice)}`);
-            kwEntry.expectedPrice = kaitoriPrice;
-          }
-        }
-      } else if (kaitoriPrice === 0) {
-        console.warn(`  [期待価格スキップ] 買取価格0円のため期待価格を保持: ${parsed.title?.slice(0, 50)}`);
-      }
-
       const profit = kaitoriPrice != null ? kaitoriPrice - effectivePrice : null;
       const profitWithEntry =
         kaitoriPrice != null ? kaitoriPrice - effectivePriceWithEntry : null;
       const selectedProfit =
         kaitoriPrice != null ? kaitoriPrice - selectedEffectivePrice : null;
 
-      // ベース利益計算（固定還元率 basePointRate を使用）
-      // ベース実質価格 = Yahoo販売価格 × (1 - basePointRate)
+      // ベース利益計算
+      // ストアポイントが1%超の場合、超過分を追加還元として加算
+      const storePointExtra = Math.max(0, (parsed.storePointRatio ?? 1) - 1) / 100;
+      const effectivePointRate = args.basePointRate + storePointExtra;
+      if (storePointExtra > 0) {
+        console.log(`  [ストアP加算] ${parsed.title?.slice(0, 20)}… ストア${parsed.storePointRatio}% → +${(storePointExtra * 100).toFixed(0)}% 合計${(effectivePointRate * 100).toFixed(0)}%`);
+      }
       const baseCost = parsed.price != null
-        ? Math.round(parsed.price * (1 - args.basePointRate))
+        ? Math.round(parsed.price * (1 - effectivePointRate))
         : null;
       const baseProfit = kaitoriPrice != null && baseCost != null
         ? kaitoriPrice - baseCost
@@ -1284,21 +1389,6 @@ async function main() {
     console.log(`Profitable candidates (利益率 0%〜${(args.maxBaseProfitRate * 100).toFixed(0)}%): ${profitable.length}件`);
 
     printResultTable(profitable);
-
-    // 利益が出たキーワードを特定（urlKeywordMap で逆引き、1URLに複数キーワード対応）
-    const profitableKeywords = new Set(
-      profitable.flatMap((r) => [...(urlKeywordMap.get(r.itemUrl) ?? [])]),
-    );
-
-    // 実際にスキャンした商品のキーワードのみmiss更新対象とする（max-items切り捨て分は除外）
-    const scannedKeywords = new Set(
-      itemUrls.flatMap((u) => [...(urlKeywordMap.get(u) ?? [])]),
-    );
-
-    // キーワードファイルのメンテナンス（日付更新・miss カウント・自動コメントアウト）
-    if (keywordsParsedLines && args.keywordsFile) {
-      await rewriteKeywordsFile(args.keywordsFile, keywordsParsedLines, profitableKeywords, scannedKeywords, today);
-    }
 
     // 新規利益商品のキーワードをファイルに追記
     if (args.appendKeywordsFile && profitable.length > 0) {
@@ -1354,7 +1444,7 @@ async function main() {
             generatedAt: new Date().toISOString(),
             input: args,
             counts: {
-              foundItemUrls: allUrls.length,
+              foundItemUrls: itemUrls.length,
               usedItemUrls: itemUrls.length,
               parsedItems: completed.length,
               profitableItems: profitable.length,
@@ -1369,9 +1459,13 @@ async function main() {
       );
       console.log(`\nJSON saved: ${args.jsonPath}`);
     }
+
+    if (args.telegramToken && args.telegramChatId) {
+      await sendTelegramNotification(args.telegramToken, args.telegramChatId, profitable, today);
+    }
   } finally {
     await yahooClient.close();
-    await closeKaitoriBrowser();
+    await kaitoriProvider.close();
   }
 }
 
