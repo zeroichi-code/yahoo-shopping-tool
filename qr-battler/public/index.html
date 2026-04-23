@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>QRバトラーズ</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Screen 1: Home -->
+  <div id="screen-home" class="screen active">
+    <div class="home-logo">
+      <div class="logo-icon">⚔️</div>
+      <h1>QRバトラーズ</h1>
+      <p class="tagline">QRコードでキャラを召喚！バトル開始！</p>
+    </div>
+    <div class="home-actions">
+      <button id="btn-start-scan" class="btn btn-primary btn-large">📷 QRスキャン</button>
+    </div>
+    <div class="home-hint">
+      <p>カメラでQRコードをスキャンして<br>あなただけのキャラクターを生成しよう</p>
+      <div class="element-guide">
+        <span class="elem-badge elem-fire">🔥 火</span>
+        <span class="arrow">→</span>
+        <span class="elem-badge elem-forest">🌲 森</span>
+        <span class="arrow">→</span>
+        <span class="elem-badge elem-water">💧 水</span>
+        <span class="arrow">→</span>
+        <span class="elem-badge elem-fire">🔥 火</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen 2: Scan -->
+  <div id="screen-scan" class="screen">
+    <h2 class="screen-title">QRコードをかざしてください</h2>
+    <div class="camera-wrapper">
+      <video id="camera-video" playsinline autoplay muted></video>
+      <canvas id="camera-canvas" style="display:none"></canvas>
+      <div class="scan-overlay">
+        <div class="scan-frame">
+          <span class="corner tl"></span>
+          <span class="corner tr"></span>
+          <span class="corner bl"></span>
+          <span class="corner br"></span>
+        </div>
+      </div>
+    </div>
+    <button id="btn-cancel-scan" class="btn btn-secondary">キャンセル</button>
+  </div>
+
+  <!-- Screen 3: Ready -->
+  <div id="screen-ready" class="screen">
+    <h2 class="screen-title">キャラクター召喚！</h2>
+    <div id="my-char-card" class="char-card-container"></div>
+    <div class="mode-buttons">
+      <button id="btn-ai-battle" class="btn btn-primary">🤖 AIと戦う</button>
+      <button id="btn-online-battle" class="btn btn-accent">🌐 オンライン対戦</button>
+    </div>
+    <button id="btn-rescan" class="btn btn-secondary btn-small">別のQRをスキャン</button>
+  </div>
+
+  <!-- Screen 4: Battle -->
+  <div id="screen-battle" class="screen">
+    <div class="battle-field">
+
+      <!-- Opponent -->
+      <div class="fighter-row opponent-row">
+        <div id="opp-char-card" class="char-card-container mini"></div>
+        <div class="hp-section">
+          <div class="hp-label-row">
+            <span id="opp-name-label" class="fighter-name">—</span>
+            <span id="opp-hp-label" class="hp-text">HP: —</span>
+          </div>
+          <div class="hp-bar-track">
+            <div id="opp-hp-bar" class="hp-bar" style="width:100%"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Battle Log -->
+      <div id="battle-log" class="battle-log">
+        <p class="log-entry log-system">バトル開始！</p>
+      </div>
+
+      <!-- My side -->
+      <div class="fighter-row my-row">
+        <div class="hp-section">
+          <div class="hp-label-row">
+            <span id="my-name-label" class="fighter-name">—</span>
+            <span id="my-hp-label" class="hp-text">HP: —</span>
+          </div>
+          <div class="hp-bar-track">
+            <div id="my-hp-bar" class="hp-bar" style="width:100%"></div>
+          </div>
+        </div>
+        <div id="my-char-card-battle" class="char-card-container mini"></div>
+      </div>
+
+    </div>
+
+    <!-- Action Panel -->
+    <div id="action-panel" class="action-panel">
+      <p class="action-label">アクションを選べ！</p>
+      <div class="action-buttons">
+        <button class="btn btn-action" data-action="attack">
+          <span class="action-icon">⚔️</span>
+          <span class="action-name">攻撃</span>
+          <span class="action-hint">防御に勝つ</span>
+        </button>
+        <button class="btn btn-action" data-action="guard">
+          <span class="action-icon">🛡️</span>
+          <span class="action-name">防御</span>
+          <span class="action-hint">反撃に勝つ</span>
+        </button>
+        <button class="btn btn-action" data-action="counter">
+          <span class="action-icon">🔄</span>
+          <span class="action-name">反撃</span>
+          <span class="action-hint">攻撃に勝つ</span>
+        </button>
+      </div>
+      <p id="waiting-label" class="waiting-label" style="display:none">⏳ 相手の選択を待っています...</p>
+    </div>
+  </div>
+
+  <!-- Screen 5: Result -->
+  <div id="screen-result" class="screen">
+    <div id="result-display" class="result-display">
+      <div id="result-icon" class="result-icon">🏆</div>
+      <h2 id="result-title" class="result-title">勝利！</h2>
+      <p id="result-subtitle" class="result-subtitle"></p>
+    </div>
+    <div class="result-buttons">
+      <button id="btn-play-again" class="btn btn-primary">もう一度戦う</button>
+      <button id="btn-back-home" class="btn btn-secondary">ホームへ</button>
+    </div>
+  </div>
+
+  <!-- Matchmaking Overlay -->
+  <div id="matchmaking-overlay" class="overlay" style="display:none">
+    <div class="overlay-content">
+      <div class="spinner"></div>
+      <h3>対戦相手を探しています...</h3>
+      <p class="overlay-hint">他のプレイヤーがオンライン対戦を開始するまでお待ちください</p>
+      <button id="btn-cancel-matchmaking" class="btn btn-secondary">キャンセル</button>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js" type="module"></script>
+</body>
+</html>
